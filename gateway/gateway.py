@@ -18,9 +18,13 @@ being written or replaced never opens the gateway.
 
 Usage: when GATEWAY_USAGE_LOG names a file, one JSON line per answered
 request is appended to it: {t, api, model, prompt, completion, estimated,
-ttft_ms, ms}. Tokens come from the engine's usage block when it sends one,
-otherwise one per streamed delta (estimated: true). The plugin reads the file
-for the tokens-per-day and decode-speed figures on the card.
+ttft_ms, ms, id}, plus cached (prompt tokens served from the engine's prefix
+cache) and reasoning (completion tokens spent thinking) when the engine reports
+them, run (the request's x-run-id header) and client (its User-Agent) when
+present. Tokens come from the engine's usage block when it sends one,
+otherwise one per streamed delta (estimated: true). /v1/chat/completions,
+/v1/completions, /v1/messages and /v1/responses are all metered. The plugin
+reads the file for the tokens-per-day and decode-speed figures on the card.
 
 Connections: at most GATEWAY_MAX_CONNECTIONS (default 64) are served at once;
 one more is closed at once. Each request, its headers and body, must arrive
@@ -87,16 +91,22 @@ def required_key():
 class Meter:
     """One answer's accounting: tokens from the engine's usage when it sends one, else one per delta; time to first token."""
 
-    def __init__(self, api, model):
+    def __init__(self, api, model, headers=None):
         self.api, self.model, self.t0 = api, model, time.monotonic()
         self.first, self.counted, self.usage = None, 0, None
+        headers = headers or {}
+        self.id = (headers.get("x-request-id") or uuid.uuid4().hex)[:64]
+        self.run = (headers.get("x-run-id") or "")[:128] or None
+        self.client = (headers.get("user-agent") or "")[:80] or None
 
     def chunk(self, obj):
         if obj.get("usage"):
             self.usage = obj["usage"]
         for choice in obj.get("choices") or []:
             delta = choice.get("delta") or {}
-            if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning") or delta.get("tool_calls"):
+            # chat streams carry deltas; /v1/completions streams carry the text on the choice itself
+            if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning") or delta.get("tool_calls") \
+                    or choice.get("text"):
                 if self.first is None:
                     self.first = time.monotonic()
                 self.counted += 1
@@ -108,7 +118,12 @@ class Meter:
         now = time.monotonic()
         row = {"t": int(time.time()), "api": self.api, "model": self.model, "prompt": usage.get("prompt_tokens", 0),
                "completion": usage.get("completion_tokens") or self.counted, "estimated": not usage,
-               "ttft_ms": int(((self.first or now) - self.t0) * 1000), "ms": int((now - self.t0) * 1000)}
+               "ttft_ms": int(((self.first or now) - self.t0) * 1000), "ms": int((now - self.t0) * 1000), "id": self.id}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        for key, value in (("cached", cached), ("reasoning", reasoning), ("run", self.run), ("client", self.client)):
+            if value is not None:
+                row[key] = value
         try:
             with USAGE_LOCK, open(USAGE_LOG, "a") as handle:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -701,7 +716,14 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/v1/responses", "/responses"):
                 return self.handle_responses(body)
             if path in ("/v1/completions", "/completions"):
-                return self.passthrough("POST", "/v1/completions", body)
+                if MODEL_ALIAS:
+                    body["model"] = MODEL_ALIAS
+                hide = False
+                if USAGE_LOG and body.get("stream"):  # as for chat: ask for the counts, show them only if asked
+                    options = body.get("stream_options") if isinstance(body.get("stream_options"), dict) else {}
+                    hide = not options.get("include_usage")
+                    body["stream_options"] = dict(options, include_usage=True)
+                return self.passthrough("POST", "/v1/completions", body, hide)
         except ValueError as error:
             return self.send_json(400, {"error": {"type": "invalid_request_error", "message": str(error)}})
         except (ConnectionError, OSError, http.client.HTTPException) as error:
@@ -710,7 +732,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"type": "not_found", "message": path}})
 
     def passthrough(self, method, path, body, hide_usage=False):
-        meter = Meter("chat", (body or {}).get("model") or MODEL_ALIAS) if path.endswith("/chat/completions") else None
+        api = "chat" if path.endswith("/chat/completions") else "completions" if path.endswith("/completions") else None
+        meter = Meter(api, (body or {}).get("model") or MODEL_ALIAS, self.headers) if api else None
         up = Upstream(method, path, body)
         with CancelGuard(self.connection, up):  # abort the engine if the client disconnects while we wait on it
             up.begin()  # returns once the engine has answered the headers: after the whole answer when not streamed
@@ -766,7 +789,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_messages(self, body):
         model = body.get("model") or MODEL_ALIAS
         chat = anthropic_to_chat(body)
-        meter = Meter("messages", MODEL_ALIAS or model)
+        meter = Meter("messages", MODEL_ALIAS or model, self.headers)
         streaming = bool(chat.get("stream"))
         if streaming:
             chat["stream_options"] = {"include_usage": True}
@@ -786,7 +809,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_responses(self, body):
         model = body.get("model") or MODEL_ALIAS
         chat = responses_to_chat(body)
-        meter = Meter("responses", MODEL_ALIAS or model)
+        meter = Meter("responses", MODEL_ALIAS or model, self.headers)
         streaming = bool(chat.get("stream"))
         if streaming:
             chat["stream_options"] = {"include_usage": True}

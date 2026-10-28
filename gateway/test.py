@@ -57,6 +57,27 @@ class FakeEngine(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.endswith("/v1/completions"):  # a plain text completion, streamed or not, with detailed usage
+            usage = {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "prompt_tokens_details": {"cached_tokens": 6}, "completion_tokens_details": {"reasoning_tokens": 2}}
+            if req.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for piece in ("Hello ", "text"):
+                    self.wfile.write(f"data: {json.dumps({'object': 'text_completion', 'choices': [{'index': 0, 'text': piece, 'finish_reason': None}]})}\n\n".encode())
+                if (req.get("stream_options") or {}).get("include_usage"):
+                    self.wfile.write(f"data: {json.dumps({'object': 'text_completion', 'choices': [], 'usage': usage})}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+                self.close_connection = True
+                return
+            body = json.dumps({"object": "text_completion", "model": req["model"], "usage": usage,
+                               "choices": [{"index": 0, "text": "Hello text", "finish_reason": "stop"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         last_user = next((m for m in reversed(req["messages"]) if m["role"] == "user"), {"content": ""})
         wants_tool = bool(req.get("tools")) and "use the tool" in str(last_user.get("content", ""))
         has_tool_result = any(m["role"] == "tool" for m in req["messages"])
@@ -426,6 +447,22 @@ def main():
         check("usage log: every dialect is recorded", apis == {"chat", "messages", "responses"}, str(apis))
         check("usage log: engine usage is used verbatim, streamed chat included", all(row["completion"] == 4 and row["prompt"] == 10 and not row["estimated"] for row in rows), str([r for r in rows if r["estimated"] or r["prompt"] != 10][:3]))
         check("usage log: model, timing and time-to-first-token are present", all(row["model"] == "fake-model" and row["ms"] >= row["ttft_ms"] >= 0 for row in rows), str(rows[:1]))
+        check("usage log: every row has its own request id", len({row.get("id") for row in rows}) == len(rows) and all(row.get("id") for row in rows), str(rows[:2]))
+        check("usage log: no cached or reasoning field when the engine reports none", all("cached" not in row and "reasoning" not in row for row in rows), str(rows[:1]))
+        # /v1/completions is metered too, with the engine's cached and reasoning counts and the caller's run tag
+        n = len(rows)
+        req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/v1/completions", data=json.dumps({"model": "m", "prompt": "hi"}).encode(),
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}", "x-run-id": "night-7/gummy", "x-request-id": "req-42", "User-Agent": "probe/1"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            plain = json.loads(response.read())
+        status, events = call("/v1/completions", {"model": "m", "prompt": "hi", "stream": True}, stream=True)
+        check("completions: the client gets the engine's answer", plain["choices"][0]["text"] == "Hello text" and status == 200 and "".join(c["text"] for e in events for c in e.get("choices", [])) == "Hello text", str(events[-2:]))
+        check("completions stream: engine is asked for usage, the client doesn't see it", FakeEngine.last_request.get("stream_options") == {"include_usage": True} and not any(e.get("usage") for e in events), str(events[-2:]))
+        time.sleep(0.2)
+        new = [json.loads(line) for line in open(usage_log)][n:]
+        check("usage log: completions recorded, streamed and not", [r["api"] for r in new] == ["completions", "completions"] and all(r["prompt"] == 10 and r["completion"] == 4 and not r["estimated"] for r in new), str(new))
+        check("usage log: cached and reasoning tokens from the engine's usage details", all(r.get("cached") == 6 and r.get("reasoning") == 2 for r in new), str(new))
+        check("usage log: x-run-id, x-request-id and User-Agent are kept", new and new[0].get("run") == "night-7/gummy" and new[0].get("id") == "req-42" and new[0].get("client") == "probe/1", str(new[:1]))
 
         # A client without the key cannot hold the gateway: a request trickled in byte by byte is cut at the deadline,
         # and with every slot held an extra connection is closed, until the deadline frees the slots again.
